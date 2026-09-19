@@ -158,24 +158,27 @@ def main():
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     Path("checkpoints").mkdir(exist_ok=True)
 
-    all_demonstrations, best_success = [], -1.0
+    all_demonstrations, best_holdout_success = [], -1.0
     beta = args.beta0
     for round_idx in range(1, args.rounds + 1):
         demos, rollout_success, rollout_reward = collect_round(policy, env, args.episodes_per_round, device, beta)
         all_demonstrations.extend(demos)
         loss = train_on_dataset(policy, optimizer, all_demonstrations, device, args.epochs_per_round, args.group_size)
-        det_success, det_reward = evaluate(policy, MIMORFNavigationEnv(seed=args.seed + round_idx), device, args.eval_episodes)
+        eval_env = MIMORFNavigationEnv(seed=args.seed + round_idx)
+        train_success, train_reward = evaluate(policy, eval_env, device, args.eval_episodes, split="train")
+        holdout_success, holdout_reward = evaluate(policy, eval_env, device, args.eval_episodes, split="holdout")
         print(f"round={round_idx:>2}/{args.rounds} beta={beta:.2f} "
               f"dataset={sum(len(t) for _, t in all_demonstrations):>7} "
               f"rollout-success={rollout_success:.1%} rollout-reward={rollout_reward:6.2f} "
-              f"eval-success={det_success:.1%} eval-reward={det_reward:6.2f} loss={loss:.3f}")
-        if det_success >= best_success:
-            best_success = det_success
+              f"train-eval={train_success:.1%} ({train_reward:6.2f}) "
+              f"holdout-eval={holdout_success:.1%} ({holdout_reward:6.2f}) loss={loss:.3f}")
+        if holdout_success >= best_holdout_success:
+            best_holdout_success = holdout_success
             torch.save({"model": policy.state_dict(), "observation_size": env.observation_size,
                        "env_config": asdict(env.config)}, "checkpoints/rf_gru_dagger.pt")
         beta = max(args.beta_min, beta * args.beta_decay)
 
-    print(f"Best deterministic success={best_success:.1%}; saved checkpoints/rf_gru_dagger.pt")
+    print(f"Best holdout-map success={best_holdout_success:.1%}; saved checkpoints/rf_gru_dagger.pt")
 
 
 if __name__ == "__main__":

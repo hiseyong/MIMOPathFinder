@@ -13,7 +13,8 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import numpy as np
 
-from RF_source_seeking_2D import AGENT, N_RX, N_TX, NX, NY, SOURCE, bfs_distance_field, make_world, mimo_channel
+from RF_source_seeking_2D import (AGENT, N_RX, N_TX, NX, NY, SOURCE, bfs_distance_field,
+                                  generate_random_world, make_world, mimo_channel)
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,49 @@ class EnvConfig:
     max_steps: int = 160
     history_length: int = 4
     source_radius: float = 1.5
+
+
+# Fixed regardless of any env instance's own `seed`, so every env -- the one
+# collecting rollouts and the ones evaluate() builds separately -- sees the
+# identical map pool and the same train/holdout partition of maps.
+MAP_POOL_SEED = 20240519
+N_TRAIN_MAPS = 5
+N_HOLDOUT_MAPS = 3
+
+_MAP_POOL: list[dict] | None = None
+
+
+def _build_map_pool() -> list[dict]:
+    """Canonical map plus randomly generated ones, split train/holdout by map.
+
+    Index 0 is always the original fixed room (make_world/AGENT/SOURCE), kept
+    as one of the training maps for continuity with earlier runs and the
+    fixed-start demo in evaluate_policy.py. The rest are generated once (see
+    RF_source_seeking_2D.generate_random_world) with varied wall layout and
+    source position, all satisfying the same "moderate difficulty" bound
+    (<=2 walls on the direct line to source, <=3 corners on the shortest
+    route). Holdout maps are never selected by reset(split="train"), so
+    success there measures generalisation across environments, not just
+    across start cells within one memorised map.
+    """
+    world0 = make_world()
+    start_band0 = [(x, y) for y in range(20, NY - 1) for x in range(1, NX - 1) if not world0[y, x]]
+    pool = [{"world": world0, "source": SOURCE, "start_band": start_band0,
+            "distance_field": bfs_distance_field(world0, SOURCE)}]
+
+    pool_rng = np.random.default_rng(MAP_POOL_SEED)
+    for _ in range(N_TRAIN_MAPS - 1 + N_HOLDOUT_MAPS):
+        world, source, start_band = generate_random_world(pool_rng)
+        pool.append({"world": world, "source": source, "start_band": start_band,
+                     "distance_field": bfs_distance_field(world, source)})
+    return pool
+
+
+def _get_map_pool() -> list[dict]:
+    global _MAP_POOL
+    if _MAP_POOL is None:
+        _MAP_POOL = _build_map_pool()
+    return _MAP_POOL
 
 
 class MIMORFNavigationEnv:
@@ -31,14 +75,28 @@ class MIMORFNavigationEnv:
 
     def __init__(self, config: EnvConfig | None = None, seed: int | None = None):
         self.config = config or EnvConfig()
-        self.world, self.rng = make_world(), np.random.default_rng(seed)
-        self.source, self.position, self.heading = SOURCE, AGENT, 0
-        # World and source never change across episodes, so the wall-aware
-        # distance-to-source field is computed once here instead of re-running
-        # A*/BFS on every step.
-        self.distance_field = bfs_distance_field(self.world, self.source)
+        self.rng = np.random.default_rng(seed)
+        self.map_pool = _get_map_pool()
+        self._select_map(0)
+        self.position, self.heading = AGENT, 0
         self.steps, self.last_action, self._remaining_distance = 0, self.FORWARD, 0
         self.rf_history: deque[np.ndarray] = deque(maxlen=self.config.history_length)
+
+    def _select_map(self, index: int) -> None:
+        # A map's distance field is precomputed once in the pool (map/source
+        # are fixed per index), not re-run on every reset.
+        m = self.map_pool[index]
+        self.map_index = index
+        self.world, self.source, self.start_band, self.distance_field = (
+            m["world"], m["source"], m["start_band"], m["distance_field"]
+        )
+
+    def _sample_map_index(self, split: str) -> int:
+        if split == "train":
+            return int(self.rng.integers(N_TRAIN_MAPS))
+        if split == "holdout":
+            return N_TRAIN_MAPS + int(self.rng.integers(len(self.map_pool) - N_TRAIN_MAPS))
+        return int(self.rng.integers(len(self.map_pool)))
 
     @property
     def observation_size(self) -> int:
@@ -48,21 +106,8 @@ class MIMORFNavigationEnv:
     def action_size(self) -> int:
         return len(self.ACTION_NAMES)
 
-    def _start_candidates(self, split: str) -> list[tuple[int, int]]:
-        candidates = [(x, y) for y in range(20, NY - 1) for x in range(1, NX - 1)
-                      if not self.world[y, x]]
-        if split == "all":
-            return candidates
-        # Deterministic per-cell partition (not per-episode RNG), so "holdout"
-        # cells are never drawn while training with split="train" and stay a
-        # genuine unseen-state generalisation check, not just an unlucky-seed
-        # draw from the exact same trained-on distribution.
-        is_holdout = lambda c: (c[0] * 31 + c[1] * 17) % 5 == 0
-        return [c for c in candidates if is_holdout(c) == (split == "holdout")]
-
-    def _sample_start(self, split: str = "train") -> tuple[int, int]:
-        candidates = self._start_candidates(split)
-        return candidates[int(self.rng.integers(len(candidates)))]
+    def _sample_start(self) -> tuple[int, int]:
+        return self.start_band[int(self.rng.integers(len(self.start_band)))]
 
     def _feature(self) -> np.ndarray:
         # rx_heading is the robot's own orientation, never the hidden source bearing.
@@ -104,8 +149,12 @@ class MIMORFNavigationEnv:
               split: str = "train") -> np.ndarray:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
-        self.position = self._sample_start(split) if random_start else AGENT
-        self.heading = int(self.rng.integers(4)) if random_start else 0
+        if random_start:
+            self._select_map(self._sample_map_index(split))
+            self.position, self.heading = self._sample_start(), int(self.rng.integers(4))
+        else:
+            self._select_map(0)
+            self.position, self.heading = AGENT, 0
         self.steps, self.last_action = 0, self.FORWARD
         self._remaining_distance = self._oracle_path_distance(self.position)
         self.rf_history.clear()
