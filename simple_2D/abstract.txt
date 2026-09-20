@@ -1,0 +1,99 @@
+================================================================================
+ABSTRACT (English)
+================================================================================
+
+Title: RF-Only Indoor Source Seeking via Wall-Aware Reward Shaping and
+Multi-Environment Imitation Learning
+
+We study RF-only source-seeking navigation, where an agent must locate a
+hidden RF source in an unknown indoor environment using only a history of
+MIMO channel-state information (CSI) -- never the occupancy map, its own
+coordinates, or the source location. The simulator models free-space path
+loss, per-wall attenuation, and array geometry over a 2D grid with
+wall-connected obstacles.
+
+We first redesign the training reward, replacing Euclidean-distance shaping
+with a breadth-first-search (BFS) potential field over the free-cell graph.
+Both the distance-shaping term and a new direction-alignment term reward the
+agent only for progress along a true, wall-aware shortest path, treating
+every equally short route as correct rather than biasing toward a single
+arbitrarily chosen one.
+
+We then re-examine the underlying learning methodology. Because a
+privileged, wall-aware optimal-direction oracle is available at every
+training step, we hypothesize the task suits imitation learning better than
+policy-gradient reinforcement learning. Empirically, PPO fine-tuning on a
+behavior-cloning-pretrained policy collapses success to 0% and never
+recovers, even after we identify and fix a genuine hidden-state/
+importance-ratio bug in the recurrent PPO loop. Replacing PPO with an
+iterative DAgger loop -- relabeling policy-visited states with the
+wall-aware teacher and retraining on the aggregated dataset -- eliminates
+the collapse and scales cleanly with data.
+
+We further replace the four-way discrete action space with a continuous
+heading regression head (a single angle mapped to a unit vector via
+cosine/sine), trained with a cosine-similarity loss against the teacher
+direction, enabling unconstrained movement.
+
+Finally, we find the trained policy follows shortest paths on its single
+fixed training map with suspicious precision, suggesting memorization. We
+introduce a procedurally generated pool of complexity-bounded maps (at most
+two walls on the direct line to the source, at most three route corners)
+with disjoint train/holdout partitions. An initial small pool (5-10 training
+maps) plateaus at 60-68% holdout success with a widening train-holdout gap,
+a clear overfitting signature. Scaling to 25 training and 8 holdout maps,
+combined with a capped replay buffer, slower teacher-mixing decay, and
+weight/learning-rate decay, closes this gap and reaches 83.8% success on
+entirely unseen maps, exceeding an 80% target and confirming genuine,
+transferable RF-to-direction learning.
+
+Keywords: RF source seeking, MIMO channel state information, imitation
+learning, DAgger, reward shaping, generalization, indoor navigation
+
+
+================================================================================
+초록 (국문)
+================================================================================
+
+제목: 벽 인식 보상 재설계와 다중 환경 모방학습을 통한 RF-only 실내 신호원 탐색
+
+무선주파수(RF)만을 이용해 미지의 실내 환경에서 숨겨진 RF 신호원을 찾아가는
+"RF-only source-seeking" 내비게이션 문제를 다룬다. 에이전트는 맵의 점유 정보,
+자신의 좌표, 신호원 위치를 전혀 제공받지 못하고, 오직 시계열 MIMO
+채널상태정보(CSI) 이력만으로 행동을 결정해야 한다. 시뮬레이터는 자유공간
+경로손실, 벽 투과 감쇠, 배열 안테나 기하구조를 반영한 2D 격자 환경으로
+구성되며, 벽에 연결된 장애물을 포함한다.
+
+먼저 학습 보상 함수를 재설계했다. 기존의 유클리드 직선거리 기반 보상 대신,
+자유 셀 그래프 위에서 BFS로 계산한 potential field를 도입해 거리 보상과 방향
+정렬 보상 모두 실제 벽을 우회하는 최단경로 진행에만 보상을 주도록 했으며,
+동일한 최단거리를 갖는 복수의 경로는 모두 정답으로 인정하도록 처리했다.
+
+다음으로 학습 방법론 자체를 재평가했다. 이 환경은 학습 시점마다 벽을
+인식하는 특권적(privileged) 최적 방향 오라클을 제공하므로, 정책경사
+강화학습보다 모방학습이 본질적으로 더 적합하다는 가설을 세우고 이를
+실증했다. Behavior cloning으로 사전학습된 정책에 PPO 파인튜닝을 적용하면
+성공률이 즉시 0%로 붕괴되어 회복되지 않았으며, 이는 recurrent PPO 구현에
+실재하는 hidden-state/importance-ratio 불일치 버그를 발견해 수정한 이후에도
+마찬가지였다. PPO를 반복적 DAgger 루프(정책이 방문한 상태를 벽 인식
+teacher로 재라벨링하여 누적 데이터셋으로 재학습)로 대체하자 붕괴 현상이
+사라지고 데이터 규모에 따라 안정적으로 성능이 향상되었다.
+
+또한 전후좌우 4방향 이산 행동 공간을 연속적인 방향 회귀(θ 각도를
+코사인/사인으로 변환한 단위벡터)로 전환하고, teacher 방향과의 코사인
+유사도 손실로 학습해 격자에 구애받지 않는 자유로운 이동을 가능하게 했다.
+
+마지막으로, 학습된 정책이 고정된 단일 학습 맵에서 지나치게 정확히 최단경로를
+재현하는 현상을 관찰해 암기(memorization) 가능성을 의심했다. 이를 검증하기
+위해 복잡도 제약(신호원까지 직선상 벽 교차 2개 이하, 경로상 코너 3개 이하)을
+만족하는 맵을 절차적으로 생성하고, 학습/홀드아웃 맵을 완전히 분리했다. 초기
+소규모 맵 풀(5~10개)에서는 holdout 성공률이 60~68%에서 정체되고
+train-holdout 격차가 계속 벌어지는 전형적 과적합 양상이 나타났다. 학습
+맵을 25개, holdout을 8개로 확대하고 replay buffer 상한, teacher 혼합
+비율의 완만한 감쇠, weight decay 및 learning-rate decay를 함께 적용하자
+이 격차가 해소되며 완전히 새로운 맵/신호원 조합에서 83.8%의 성공률을
+달성해, 목표치인 80%를 상회하고 정책이 환경별 암기가 아닌 실제 전이
+가능한 RF-방향 매핑을 학습했음을 확인했다.
+
+키워드: RF 신호원 탐색, MIMO 채널상태정보, 모방학습, DAgger, 보상 설계,
+일반화, 실내 내비게이션

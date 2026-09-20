@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# Transient training-resume checkpoints: large, regenerable by rerunning
+# training, and not meaningful research artifacts on their own.
+checkpoints/*_resume.pt
