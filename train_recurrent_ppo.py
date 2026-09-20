@@ -9,6 +9,12 @@ ratio against most rollouts since rollout=512 >> the ~160-step episode
 length). Meanwhile pure DAgger pretraining scaled cleanly with data (5%
 success at 400 episodes -> 17.5% at 1200). Use train_dagger.py instead.
 
+BROKEN as of the continuous-direction action space and multi-map pool: this
+file still assumes 4 discrete grid actions (env.expert_action,
+env.action_size, env.ACTION_NAMES) which mimo_rl_env.MIMORFNavigationEnv no
+longer has. Kept only as a record of the PPO-collapse finding above; do not
+run it without porting it to the continuous API in train_dagger.py first.
+
 Example: poetry run python train_recurrent_ppo.py --timesteps 100000
 """
 from __future__ import annotations

@@ -5,6 +5,7 @@ during training (see mimo_rl_env.N_TRAIN_MAPS/N_HOLDOUT_MAPS), so this is a
 genuine unseen-environment test rather than a replay of a memorised route.
 """
 import argparse
+import math
 from pathlib import Path
 
 import torch
@@ -22,19 +23,21 @@ def main():
 
     data = torch.load("checkpoints/rf_gru_dagger.pt", map_location="cpu", weights_only=True)
     env = MIMORFNavigationEnv()
-    policy = RecurrentPolicy(data["observation_size"], env.action_size)
+    policy = RecurrentPolicy(data["observation_size"])
     policy.load_state_dict(data["model"]); policy.eval()
     observation = env.reset(seed=args.seed, split=args.split)
-    hidden, trajectory, done, episode_start = torch.zeros(1, 1, policy.hidden_size), [env.position], False, True
+    pos0 = (round(float(env.position[0]), 2), round(float(env.position[1]), 2))
+    hidden, trajectory, done, episode_start = torch.zeros(1, 1, policy.hidden_size), [pos0], False, True
     print(f"map_index={env.map_index} (split={args.split}) source={env.source}")
-    print(f"step   0: pos={env.position} heading={env.heading}")
+    print(f"step   0: pos={pos0} heading={math.degrees(env.heading):.1f}deg")
     while not done:
-        action, hidden = policy.greedy_action(torch.as_tensor(observation), hidden, episode_start)
-        observation, reward, done, info = env.step(action)
-        pos = (int(env.position[0]), int(env.position[1]))
+        direction, hidden = policy.greedy_direction(torch.as_tensor(observation), hidden, episode_start)
+        observation, reward, done, info = env.step(direction)
+        pos = (round(float(env.position[0]), 2), round(float(env.position[1]), 2))
         trajectory.append(pos)
+        angle_deg = math.degrees(math.atan2(direction[1], direction[0]))
         flag = "  <- COLLISION" if info["collision"] else ("  <- REACHED" if info["reached"] else "")
-        print(f"step {info['steps']:3d}: pos={pos} action={env.ACTION_NAMES[action]:<22} reward={reward:+.2f}{flag}")
+        print(f"step {info['steps']:3d}: pos={pos} dir={angle_deg:6.1f}deg reward={reward:+.2f}{flag}")
         episode_start = False
     Path("outputs").mkdir(exist_ok=True)
     env.render(trajectory).savefig("outputs/evaluation_trajectory.png", dpi=160, bbox_inches="tight")

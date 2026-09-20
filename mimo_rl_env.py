@@ -22,14 +22,15 @@ class EnvConfig:
     max_steps: int = 160
     history_length: int = 4
     source_radius: float = 1.5
+    step_size: float = 1.0
 
 
 # Fixed regardless of any env instance's own `seed`, so every env -- the one
 # collecting rollouts and the ones evaluate() builds separately -- sees the
 # identical map pool and the same train/holdout partition of maps.
 MAP_POOL_SEED = 20240519
-N_TRAIN_MAPS = 5
-N_HOLDOUT_MAPS = 3
+N_TRAIN_MAPS = 25
+N_HOLDOUT_MAPS = 8
 
 _MAP_POOL: list[dict] | None = None
 
@@ -68,9 +69,14 @@ def _get_map_pool() -> list[dict]:
 
 
 class MIMORFNavigationEnv:
-    """POMDP: RF history in, relative motion action out."""
-    FORWARD, LEFT, RIGHT, BACK = range(4)
-    ACTION_NAMES = ("forward", "left + forward", "right + forward", "turn around + forward")
+    """POMDP: RF history in, a continuous 2D heading direction out.
+
+    step() takes any real 2-vector; only its angle is used (it is
+    renormalised internally), so the policy is free to move at any heading,
+    not just the four grid-cardinal directions.
+    """
+    # Cardinal reference directions used only internally (BFS teacher/reward
+    # geometry over the grid); never the action space itself any more.
     DIRECTIONS = np.array(((1, 0), (0, 1), (-1, 0), (0, -1)), dtype=int)
 
     def __init__(self, config: EnvConfig | None = None, seed: int | None = None):
@@ -78,8 +84,9 @@ class MIMORFNavigationEnv:
         self.rng = np.random.default_rng(seed)
         self.map_pool = _get_map_pool()
         self._select_map(0)
-        self.position, self.heading = AGENT, 0
-        self.steps, self.last_action, self._remaining_distance = 0, self.FORWARD, 0
+        self.position, self.heading = np.array(AGENT, dtype=float), 0.0
+        self.last_direction = np.array([1.0, 0.0], dtype=np.float32)
+        self.steps, self._remaining_distance = 0, 0
         self.rf_history: deque[np.ndarray] = deque(maxlen=self.config.history_length)
 
     def _select_map(self, index: int) -> None:
@@ -100,50 +107,64 @@ class MIMORFNavigationEnv:
 
     @property
     def observation_size(self) -> int:
-        return self.config.history_length * (2 * N_RX * N_TX + N_RX + 1 + self.action_size)
-
-    @property
-    def action_size(self) -> int:
-        return len(self.ACTION_NAMES)
+        # +2 for the last executed direction (unit vector), replacing the old
+        # one-hot over 4 discrete actions.
+        return self.config.history_length * (2 * N_RX * N_TX + N_RX + 1 + 2)
 
     def _sample_start(self) -> tuple[int, int]:
         return self.start_band[int(self.rng.integers(len(self.start_band)))]
 
     def _feature(self) -> np.ndarray:
-        # rx_heading is the robot's own orientation, never the hidden source bearing.
-        h = mimo_channel(self.position, self.source, self.world, rx_heading=self.heading * pi / 2)
+        # rx_heading is the robot's own continuous orientation (radians),
+        # never the hidden source bearing.
+        h = mimo_channel(self.position, self.source, self.world, rx_heading=self.heading)
         amp = np.log10(np.abs(h) + 1e-15).ravel()
         phase = (np.angle(h) / pi).ravel()
         singular = np.log10(np.linalg.svd(h, compute_uv=False) + 1e-15)
         mean_power = np.array([np.log10(np.mean(np.abs(h) ** 2) + 1e-30)])
-        action = np.eye(self.action_size, dtype=np.float32)[self.last_action]
-        return np.concatenate((amp, phase, singular, mean_power, action)).astype(np.float32)
+        return np.concatenate((amp, phase, singular, mean_power, self.last_direction)).astype(np.float32)
 
     def _observation(self) -> np.ndarray:
         return np.concatenate(tuple(self.rf_history), dtype=np.float32)
 
-    def _oracle_path_distance(self, point: tuple[int, int]) -> int:
+    def _cell(self, point) -> tuple[int, int]:
+        x = int(np.clip(round(float(point[0])), 0, NX - 1))
+        y = int(np.clip(round(float(point[1])), 0, NY - 1))
+        return x, y
+
+    def _oracle_path_distance(self, point) -> int:
         # Privileged for training reward only; never returned in an observation.
         # Wall-aware BFS graph distance, never Euclidean/straight-line distance.
-        return int(self.distance_field[point[1], point[0]])
+        x, y = self._cell(point)
+        return int(self.distance_field[y, x])
 
-    def _optimal_headings(self, point: tuple[int, int]) -> list[int]:
-        """All headings that step onto an actually reachable shortest route.
+    def _optimal_headings(self, point) -> list[int]:
+        """All cardinal headings that step onto an actually reachable shortest route.
 
         Every heading whose neighbour cell's BFS distance is exactly one less
         than the current cell's is an equally correct "answer" direction: by
         construction these are never wall crossings, and ties (several
         equally short routes around an obstacle) are all treated as correct
         instead of arbitrarily picking one path like a single A* run would.
+        Used only as the continuous teacher/reward reference geometry, on the
+        grid cell nearest the (possibly continuous) point.
         """
-        here = self.distance_field[point[1], point[0]]
+        cx, cy = self._cell(point)
+        here = self.distance_field[cy, cx]
         headings = []
         for heading, (dx, dy) in enumerate(self.DIRECTIONS):
-            nx, ny = point[0] + dx, point[1] + dy
+            nx, ny = cx + dx, cy + dy
             if (0 <= nx < NX and 0 <= ny < NY and not self.world[ny, nx]
                     and self.distance_field[ny, nx] == here - 1):
                 headings.append(heading)
         return headings
+
+    def _blocked(self, start: np.ndarray, end: np.ndarray) -> bool:
+        for t in np.linspace(0.0, 1.0, 6)[1:]:
+            x, y = self._cell(start + t * (end - start))
+            if self.world[y, x]:
+                return True
+        return False
 
     def reset(self, *, seed: int | None = None, random_start: bool = True,
               split: str = "train") -> np.ndarray:
@@ -151,11 +172,13 @@ class MIMORFNavigationEnv:
             self.rng = np.random.default_rng(seed)
         if random_start:
             self._select_map(self._sample_map_index(split))
-            self.position, self.heading = self._sample_start(), int(self.rng.integers(4))
+            self.position = np.array(self._sample_start(), dtype=float)
+            self.heading = float(self.rng.uniform(-pi, pi))
         else:
             self._select_map(0)
-            self.position, self.heading = AGENT, 0
-        self.steps, self.last_action = 0, self.FORWARD
+            self.position, self.heading = np.array(AGENT, dtype=float), 0.0
+        self.steps = 0
+        self.last_direction = np.array([np.cos(self.heading), np.sin(self.heading)], dtype=np.float32)
         self._remaining_distance = self._oracle_path_distance(self.position)
         self.rf_history.clear()
         feature = self._feature()
@@ -163,44 +186,43 @@ class MIMORFNavigationEnv:
             self.rf_history.append(feature.copy())
         return self._observation()
 
-    def step(self, action: int):
-        if action not in (self.FORWARD, self.LEFT, self.RIGHT, self.BACK):
-            raise ValueError(f"Unknown action: {action}")
+    def step(self, direction: np.ndarray):
+        """direction: any real 2-vector; renormalised to a unit heading."""
+        direction = np.asarray(direction, dtype=float)
+        norm = float(np.linalg.norm(direction))
+        unit = direction / norm if norm > 1e-8 else np.array([np.cos(self.heading), np.sin(self.heading)])
+
         old_distance = self._remaining_distance
         optimal_headings = self._optimal_headings(self.position)
-        if action == self.LEFT:
-            self.heading = (self.heading - 1) % 4
-        elif action == self.RIGHT:
-            self.heading = (self.heading + 1) % 4
-        elif action == self.BACK:
-            self.heading = (self.heading + 2) % 4
-        # Reward the direction actually chosen this step against every
-        # wall-aware shortest-route heading, not the straight line to source.
-        on_shortest_route = self.heading in optimal_headings
-        candidate = tuple(self.position + self.DIRECTIONS[self.heading])
-        collision = self.world[candidate[1], candidate[0]]
+        # Cosine alignment with every wall-aware shortest-route heading, not
+        # the straight line to source: 1.0 if moving exactly along one of
+        # them, negative if moving away.
+        best_alignment = max((float(unit @ self.DIRECTIONS[h]) for h in optimal_headings), default=0.0)
+
+        self.heading = float(np.arctan2(unit[1], unit[0]))
+        candidate = self.position + self.config.step_size * unit
+        collision = self._blocked(self.position, candidate)
         if not collision:
             self.position = candidate
             self._remaining_distance = self._oracle_path_distance(self.position)
         self.steps += 1
-        reached = np.linalg.norm(np.asarray(self.position) - np.asarray(self.source)) <= self.config.source_radius
+        reached = np.linalg.norm(self.position - np.asarray(self.source, dtype=float)) <= self.config.source_radius
         timeout, terminated = self.steps >= self.config.max_steps, reached or self.steps >= self.config.max_steps
         reward = 0.35 * (old_distance - self._remaining_distance) - 0.02
         if optimal_headings:
-            reward += 0.3 if on_shortest_route else -0.1
+            reward += 0.3 * best_alignment
         reward += -0.8 if collision else 0.0
         reward += 20.0 if reached else (-2.0 if timeout else 0.0)
-        self.last_action = action
+        self.last_direction = unit.astype(np.float32)
         self.rf_history.append(self._feature())
         return self._observation(), float(reward), terminated, {"reached": reached, "collision": collision, "steps": self.steps}
 
-    def expert_action(self) -> int:
-        """Wall-aware teacher action, available only while constructing training data."""
+    def expert_direction(self) -> np.ndarray:
+        """Wall-aware teacher direction (unit vector), available only while constructing training data."""
         optimal_headings = self._optimal_headings(self.position)
         if not optimal_headings:
-            return self.FORWARD
-        turn = (optimal_headings[0] - self.heading) % 4
-        return {0: self.FORWARD, 1: self.RIGHT, 2: self.BACK, 3: self.LEFT}[turn]
+            return np.array([np.cos(self.heading), np.sin(self.heading)], dtype=np.float32)
+        return self.DIRECTIONS[optimal_headings[0]].astype(np.float32)
 
     def render(self, trajectory: list[tuple[int, int]] | None = None):
         fig, ax = plt.subplots(figsize=(9, 6))
